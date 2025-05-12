@@ -1,0 +1,14 @@
+# Git
+.git/
+.gitignore
+
+# Data
+data/
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Envs
+.env
+venv/

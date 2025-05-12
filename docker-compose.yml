@@ -1,0 +1,12 @@
+services:
+  train:
+    platform: linux/arm64        
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python src/train.py
