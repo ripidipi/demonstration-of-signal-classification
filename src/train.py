@@ -1,8 +1,7 @@
 import os
 import argparse
-from datetime import datetime
 import matplotlib.pyplot as plt
-from tqdm import tqdm
+from tqdm import trange
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -15,7 +14,7 @@ def train(model, loader, optimizer, criterion, device):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
 
-    for X, y in tqdm(loader, desc="Training", leave=False):
+    for X, y in loader:
         X, y = X.to(device), y.to(device)
         optimizer.zero_grad()
         output = model(X)
@@ -34,7 +33,7 @@ def validate(model, loader, criterion, device):
     total_loss, correct, total = 0.0, 0, 0
 
     with torch.no_grad():
-        for X, y in tqdm(loader, desc="Validating", leave=False):
+        for X, y in loader:
             X, y = X.to(device), y.to(device)
             output = model(X)
             loss = criterion(output, y)
@@ -80,7 +79,6 @@ def main():
     print_header(f"Using device: {device}")
 
     data_path = "data/raw/RML2016.10a_dict.pkl"
-    
     train_loader, val_loader, le = get_dataloaders(data_path)
 
     if args.resume:
@@ -92,7 +90,7 @@ def main():
         print_success(f"Resuming from epoch {start_epoch}")
     else:
         model = CNNClassifier(num_classes=len(le.classes_)).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
+        optimizer = optim.Adam(model.parameters(), lr=3e-4, weight_decay=5e-5)
         start_epoch = 0
         print_success("Starting new training session")
 
@@ -107,10 +105,10 @@ def main():
     best_acc = 0.0
     total_epochs = 40
 
-    print_header("===Starting Training===")
+    print_header("=== Starting Training ===")
 
     try:
-        for epoch in range(start_epoch, total_epochs):
+        for epoch in trange(start_epoch, total_epochs, desc="Training Progress"):
             tr_loss, tr_acc = train(model, train_loader, optimizer, criterion, device)
             val_loss, val_acc = validate(model, val_loader, criterion, device)
 
@@ -139,3 +137,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# Usage 
+# python src/train.py 
+# python src/train.py --resume checkpoints/best_model.pth           
