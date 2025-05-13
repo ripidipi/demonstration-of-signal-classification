@@ -12,6 +12,7 @@ venv3/
 # Data
 data/raw/
 data/processed/
+samples/
 
 # IDE / macOS
 .DS_Store
