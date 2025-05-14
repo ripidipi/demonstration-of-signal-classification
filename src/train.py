@@ -1,143 +1,151 @@
 import os
 import argparse
 import matplotlib.pyplot as plt
-from tqdm import trange
+from tqdm import tqdm
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import OneCycleLR
+from colorama import Fore, Style, init
+
 from dataset import get_dataloaders
 from model import CNNClassifier
 from save import load_checkpoint, save_checkpoint
-from some_decorators import print_epoch_progress, print_header, print_success, print_warning
+from some_decorators import print_header, print_success, print_warning
 
-def train(model, loader, optimizer, criterion, device):
+init(autoreset=True)
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, weight=None):
+        super().__init__()
+        self.gamma = gamma
+        self.ce = nn.CrossEntropyLoss(weight=weight)
+
+    def forward(self, logits, target):
+        logp = -self.ce(logits, target)
+        p = torch.exp(logp)
+        loss = -((1 - p) ** self.gamma) * logp
+        return loss.mean()
+
+def train_epoch(model, loader, optimizer, scheduler, criterion, device):
     model.train()
-    total_loss, correct, total = 0.0, 0, 0
-
-    for X, y in loader:
+    tot_loss, tot_corr, tot = 0, 0, 0
+    pbar = tqdm(loader, desc=f"{Fore.BLUE}Train{Style.RESET_ALL}", leave=False)
+    for X, y in pbar:
         X, y = X.to(device), y.to(device)
         optimizer.zero_grad()
-        output = model(X)
-        loss = criterion(output, y)
+        logits = model(X)
+        loss = criterion(logits, y)
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
-        total_loss += loss.item() * X.size(0)
-        correct += (output.argmax(dim=1) == y).sum().item()
-        total += y.size(0)
+        preds = logits.argmax(1)
+        acc = (preds == y).float().mean().item()
+        tot_loss += loss.item()*y.size(0)
+        tot_corr += (preds == y).sum().item()
+        tot += y.size(0)
 
-    return total_loss / total, correct / total
+        pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.2%}")
+    return tot_loss/tot, tot_corr/tot
 
-def validate(model, loader, criterion, device):
+def valid_epoch(model, loader, criterion, device):
     model.eval()
-    total_loss, correct, total = 0.0, 0, 0
-
+    tot_loss, tot_corr, tot = 0, 0, 0
     with torch.no_grad():
-        for X, y in loader:
+        pbar = tqdm(loader, desc=f"{Fore.GREEN}Valid{Style.RESET_ALL}", leave=False)
+        for X, y in pbar:
             X, y = X.to(device), y.to(device)
-            output = model(X)
-            loss = criterion(output, y)
+            logits = model(X)
+            loss = criterion(logits, y)
+            preds = logits.argmax(1)
 
-            total_loss += loss.item() * X.size(0)
-            correct += (output.argmax(dim=1) == y).sum().item()
-            total += y.size(0)
+            acc = (preds == y).float().mean().item()
+            tot_loss += loss.item()*y.size(0)
+            tot_corr += (preds == y).sum().item()
+            tot += y.size(0)
 
-    return total_loss / total, correct / total
+            pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.2%}")
+    return tot_loss/tot, tot_corr/tot
 
-def plot_history(train_losses, val_losses, train_accs, val_accs):
-    plt.figure(figsize=(12, 5))
-
-    plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label="Train")
-    plt.plot(val_losses, label="Val")
-    plt.title("Loss")
-    plt.xlabel("Epoch")
-    plt.legend()
-
-    plt.subplot(1, 2, 2)
-    plt.plot(train_accs, label="Train")
-    plt.plot(val_accs, label="Val")
-    plt.title("Accuracy")
-    plt.xlabel("Epoch")
-    plt.legend()
-
-    plt.tight_layout()
-    plt.savefig("training_progress.png")
-    plt.close()
+def plot_history(hist, save_path="training_progress.png"):
+    plt.figure(figsize=(12,5))
+    epochs = range(1, len(hist['tr_loss'])+1)
+    plt.subplot(1,2,1)
+    plt.plot(epochs, hist['tr_loss'], label='Train')
+    plt.plot(epochs, hist['val_loss'], label='Val')
+    plt.title('Loss'); plt.xlabel('Epoch'); plt.legend()
+    plt.subplot(1,2,2)
+    plt.plot(epochs, hist['tr_acc'], label='Train')
+    plt.plot(epochs, hist['val_acc'], label='Val')
+    plt.title('Accuracy'); plt.xlabel('Epoch'); plt.legend()
+    plt.tight_layout(); plt.savefig(save_path); plt.close()
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--resume", type=str, help="Path to checkpoint")
-    parser.add_argument("--save-dir", type=str, default="checkpoints")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--resume', type=str)
+    p.add_argument('--save_dir', type=str, default='checkpoints')
+    args = p.parse_args()
 
-    device = torch.device(
-        "mps" if torch.backends.mps.is_available() 
-        else "cuda" if torch.cuda.is_available() 
-        else "cpu"
-    )
+    device = torch.device('mps' if torch.backends.mps.is_available()
+                          else 'cuda' if torch.cuda.is_available()
+                          else 'cpu')
     print_header(f"Using device: {device}")
 
-    data_path = "data/raw/RML2016.10a_dict.pkl"
-    train_loader, val_loader, le = get_dataloaders(data_path)
+    tr_loader, val_loader, le = get_dataloaders(
+        'data/raw/RML2016.10a_dict.pkl',
+        batch_size=256, num_workers=8
+    )
 
+    model = CNNClassifier(num_classes=len(le.classes_)).to(device)
+    start_epoch = 0
     if args.resume:
-        model = CNNClassifier(num_classes=len(le.classes_)).to(device)
-        optimizer = optim.Adam(model.parameters())  
-        model, optimizer, start_epoch, _ = load_checkpoint(
-            model, optimizer, args.resume, device
+        opt = AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+        model, opt, start_epoch, _ = load_checkpoint(
+            model, opt, args.resume, device
         )
-        print_success(f"Resuming from epoch {start_epoch}")
+        print_success(f"Resumed from epoch {start_epoch}")
     else:
-        model = CNNClassifier(num_classes=len(le.classes_)).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=3e-4, weight_decay=5e-5)
-        start_epoch = 0
-        print_success("Starting new training session")
+        opt = AdamW(model.parameters(), lr=3e-3, weight_decay=1e-4)
+        print_success("Starting new training")
 
-    criterion = nn.CrossEntropyLoss()
+    total_steps = 100 * len(tr_loader)
+    scheduler = OneCycleLR(
+        opt, max_lr=1e-2, total_steps=total_steps,
+        pct_start=0.3, anneal_strategy='cos',
+        div_factor=25, final_div_factor=1e4
+    )
+    criterion = FocalLoss(gamma=2.0)
 
-    sample, _ = next(iter(train_loader))
-    print(f"Input shape: {sample.shape}")
-    print(f"Output shape: {model(sample.to(device)).shape}")
-
-    train_losses, val_losses = [], []
-    train_accs, val_accs = [], []
+    history = {'tr_loss':[], 'val_loss':[], 'tr_acc':[], 'val_acc':[]}
     best_acc = 0.0
-    total_epochs = 40
 
-    print_header("=== Starting Training ===")
+    for epoch in range(start_epoch, 100):
+        print_header(f"Epoch {epoch+1}/100")
+        tr_loss, tr_acc = train_epoch(model, tr_loader, opt, scheduler, criterion, device)
+        val_loss, val_acc = valid_epoch(model, val_loader, criterion, device)
 
-    try:
-        for epoch in trange(start_epoch, total_epochs, desc="Training Progress"):
-            tr_loss, tr_acc = train(model, train_loader, optimizer, criterion, device)
-            val_loss, val_acc = validate(model, val_loader, criterion, device)
+        history['tr_loss'].append(tr_loss)
+        history['val_loss'].append(val_loss)
+        history['tr_acc'].append(tr_acc)
+        history['val_acc'].append(val_acc)
 
-            train_losses.append(tr_loss)
-            val_losses.append(val_loss)
-            train_accs.append(tr_acc)
-            val_accs.append(val_acc)
+        print(f"Epoch {epoch+1}: Tr Acc={tr_acc:.2%} | Val Acc={val_acc:.2%}")
+        if val_acc > best_acc:
+            best_acc = val_acc
+            save_checkpoint(
+                model, opt, epoch+1, val_loss, val_acc,
+                le.classes_, args.save_dir, is_best=True
+            )
+            print_success(f"Best acc {best_acc:.2%} saved")
+        if (epoch+1)%10==0:
+            save_checkpoint(
+                model, opt, epoch+1, val_loss, val_acc,
+                le.classes_, args.save_dir, is_best=False
+            )
 
-            print_epoch_progress(epoch, total_epochs, tr_loss, tr_acc, val_loss, val_acc)
+    plot_history(history)
+    print_header("Training finished")
 
-            if val_acc > best_acc:
-                best_acc = val_acc
-                save_checkpoint(model, optimizer, epoch + 1, val_loss, val_acc, le.classes_, args.save_dir, is_best=True)
-                print_success(f"New best accuracy: {val_acc:.2%} - model saved!")
-
-            if (epoch + 1) % 10 == 0:
-                save_checkpoint(model, optimizer, epoch + 1, val_loss, val_acc, le.classes_, args.save_dir, is_best=False)
-
-        plot_history(train_losses, val_losses, train_accs, val_accs)
-        print_header("Training Complete!")
-
-    except KeyboardInterrupt:
-        print_warning("Training interrupted! Saving current state...")
-        save_checkpoint(model, optimizer, epoch + 1, val_loss, val_acc, le.classes_, args.save_dir, is_best=False)
-        print_success("Checkpoint saved.")
-
-if __name__ == "__main__":
+if __name__=='__main__':
     main()
-
-# Usage 
-# python src/train.py 
-# python src/train.py --resume checkpoints/best_model.pth           
