@@ -29,10 +29,7 @@ def load_data(path):
 def get_dataloaders(path: str,
                     batch_size: int = 256,
                     val_fraction: float = 0.2,
-                    num_workers: int = 4):
-    """
-    Возвращает train_loader, val_loader, label_encoder.
-    """
+                    num_workers: int = 8):
 
     train_ds = RadioMLDataset(
         path,

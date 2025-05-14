@@ -43,7 +43,7 @@ class ResSEBlock(nn.Module):
 
 
 class TimeTransformer(nn.Module):
-    def __init__(self, dim, num_heads=4, num_layers=2, dropout=0.1):
+    def __init__(self, dim, num_heads=4, num_layers=2, dropout=0.4):
         super().__init__()
         layer = nn.TransformerEncoderLayer(
             d_model=dim, nhead=num_heads,
@@ -74,18 +74,20 @@ class CNNClassifier(nn.Module):
             ResSEBlock(128,256, kernel_size=3, padding=1),
             nn.MaxPool1d(2)  # → (B,256, L/8)
         )
-
-        self.transformer = TimeTransformer(dim=256, num_heads=8, num_layers=3, dropout=0.1)
-
-        self.global_pool = nn.AdaptiveAvgPool1d(1)  # → (B,256,1)
+        self.layer4 = nn.Sequential(
+            ResSEBlock(256, 1024, 3, 1),
+            nn.MaxPool1d(2)
+        )
+        self.transformer = TimeTransformer(dim=1024, num_heads=8, num_layers=5, dropout=0.6)
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
         self.classifier = nn.Sequential(
-            nn.Flatten(),         # → (B,256)
-            nn.Dropout(0.5),
-            nn.Linear(256, 128),
+            nn.Flatten(),
+            nn.Dropout(0.6),
+            nn.Linear(1024, 512),
             nn.ReLU(inplace=True),
-            nn.BatchNorm1d(128),
-            nn.Dropout(0.5),
-            nn.Linear(128, num_classes)
+            nn.BatchNorm1d(512),
+            nn.Dropout(0.6),
+            nn.Linear(512, num_classes)
         )
 
         for m in self.modules():
@@ -95,10 +97,10 @@ class CNNClassifier(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        # x: (B,2,T)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
+        x = self.layer4(x)
         x = self.transformer(x)
         x = self.global_pool(x)
         return self.classifier(x)  # → (B,num_classes)
