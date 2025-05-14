@@ -120,7 +120,7 @@ def main():
     history = {'tr_loss':[], 'val_loss':[], 'tr_acc':[], 'val_acc':[]}
     best_acc = 0.0
 
-    for epoch in range(start_epoch, 100):
+    for epoch in range(start_epoch, 50):
         print_header(f"Epoch {epoch+1}/100")
         tr_loss, tr_acc = train_epoch(model, tr_loader, opt, scheduler, criterion, device)
         val_loss, val_acc = valid_epoch(model, val_loader, criterion, device)
@@ -149,3 +149,7 @@ def main():
 
 if __name__=='__main__':
     main()
+
+
+# Usege
+# python src/train.py --resume checkpoints/best_model.pth 
