@@ -75,21 +75,19 @@ class CNNClassifier(nn.Module):
             nn.MaxPool1d(2)  # → (B,256, L/8)
         )
         self.layer4 = nn.Sequential(
-            ResSEBlock(256, 512, kernel_size=3, padding=1),
-            nn.MaxPool1d(2)  # → (B,512, L/16)
+            ResSEBlock(256, 1024, 3, 1),
+            nn.MaxPool1d(2)
         )
-
-        self.transformer = TimeTransformer(dim=512, num_heads=8, num_layers=3, dropout=0.5)
-
-        self.global_pool = nn.AdaptiveAvgPool1d(1)  # → (B,256,1)
+        self.transformer = TimeTransformer(dim=1024, num_heads=8, num_layers=5, dropout=0.6)
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
         self.classifier = nn.Sequential(
-            nn.Flatten(),         # → (B,256)
-            nn.Dropout(0.4),
-            nn.Linear(512, 256),
+            nn.Flatten(),
+            nn.Dropout(0.6),
+            nn.Linear(1024, 512),
             nn.ReLU(inplace=True),
-            nn.BatchNorm1d(256),
-            nn.Dropout(0.4),
-            nn.Linear(256, num_classes)
+            nn.BatchNorm1d(512),
+            nn.Dropout(0.6),
+            nn.Linear(512, num_classes)
         )
 
         for m in self.modules():
