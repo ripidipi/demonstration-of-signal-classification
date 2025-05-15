@@ -8,7 +8,7 @@ from datetime import datetime
 from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
 from colorama import Fore, Style, init
-from dataset import get_dataloaders
+from loader import get_dataloaders
 from model import CNNClassifier
 
 
