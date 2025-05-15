@@ -2,7 +2,7 @@ import os
 import torch
 import matplotlib.pyplot as plt
 import random
-from dataset import get_dataloaders
+from loader import get_dataloaders
 from model import CNNClassifier
 from save import load_checkpoint
 from some_decorators import print_header, print_success

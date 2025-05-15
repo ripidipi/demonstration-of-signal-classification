@@ -1,155 +1,131 @@
-import os
 import argparse
-import matplotlib.pyplot as plt
-from tqdm import tqdm
+from tqdm import trange, tqdm
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
-from colorama import Fore, Style, init
+from torch.amp import GradScaler, autocast
 
-from dataset import get_dataloaders
+from loader import get_dataloaders
 from model import CNNClassifier
-from save import load_checkpoint, save_checkpoint
-from some_decorators import print_header, print_success, print_warning
+from save import save_checkpoint
 
-init(autoreset=True)
 
 class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, weight=None):
+    def __init__(self, gamma=2.0):
         super().__init__()
         self.gamma = gamma
-        self.ce = nn.CrossEntropyLoss(weight=weight)
+        self.ce = nn.CrossEntropyLoss()
 
-    def forward(self, logits, target):
-        logp = -self.ce(logits, target)
+    def forward(self, logits, targets):
+        logp = -self.ce(logits, targets)
         p = torch.exp(logp)
-        loss = -((1 - p) ** self.gamma) * logp
-        return loss.mean()
+        return -((1 - p) ** self.gamma * logp).mean()
 
-def train_epoch(model, loader, optimizer, scheduler, criterion, device):
+
+def train_epoch(model, loader, optimizer, scheduler, criterion, scaler, device, pin_mem, use_amp):
     model.train()
-    tot_loss, tot_corr, tot = 0, 0, 0
-    pbar = tqdm(loader, desc=f"{Fore.BLUE}Train{Style.RESET_ALL}", leave=False)
-    for X, y in pbar:
-        X, y = X.to(device), y.to(device)
-        optimizer.zero_grad()
-        logits = model(X)
-        loss = criterion(logits, y)
-        loss.backward()
-        optimizer.step()
+    total_loss = total_correct = total_samples = 0
+
+    # Use per-sample loss for mixup
+    ce_none = nn.CrossEntropyLoss(reduction='none')
+
+    for X, y in tqdm(loader, desc='Train ', leave=False):
+        X = X.to(device, non_blocking=pin_mem)
+        y1, y2, lam = y
+        y1 = y1.to(device, non_blocking=pin_mem)
+        y2 = y2.to(device, non_blocking=pin_mem)
+        lam = lam.to(device, non_blocking=pin_mem)
+
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(device_type=device.type, enabled=use_amp):
+            logits = model(X)
+            # per-sample cross-entropy
+            loss1 = ce_none(logits, y1)
+            loss2 = ce_none(logits, y2)
+            # weighted combination per sample, then average
+            mixed_loss = lam * loss1 + (1 - lam) * loss2
+            loss = mixed_loss.mean()
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
         scheduler.step()
 
-        preds = logits.argmax(1)
-        acc = (preds == y).float().mean().item()
-        tot_loss += loss.item()*y.size(0)
-        tot_corr += (preds == y).sum().item()
-        tot += y.size(0)
+        preds = logits.argmax(dim=1)
+        total_correct += (preds == y1).sum().item()
+        total_loss += loss.item() * X.size(0)
+        total_samples += X.size(0)
 
-        pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.2%}")
-    return tot_loss/tot, tot_corr/tot
+    return total_loss / total_samples, total_correct / total_samples
 
-def valid_epoch(model, loader, criterion, device):
+
+def valid_epoch(model, loader, criterion, device, pin_mem, use_amp):
     model.eval()
-    tot_loss, tot_corr, tot = 0, 0, 0
+    total_loss = total_correct = total_samples = 0
     with torch.no_grad():
-        pbar = tqdm(loader, desc=f"{Fore.GREEN}Valid{Style.RESET_ALL}", leave=False)
-        for X, y in pbar:
-            X, y = X.to(device), y.to(device)
-            logits = model(X)
-            loss = criterion(logits, y)
-            preds = logits.argmax(1)
+        for X, y in tqdm(loader, desc='Valid ', leave=False):
+            X = X.to(device, non_blocking=pin_mem)
+            y = y.to(device, non_blocking=pin_mem)
+            with autocast(device_type=device.type, enabled=use_amp):
+                logits = model(X)
+                loss = criterion(logits, y)
+            preds = logits.argmax(dim=1)
+            total_correct += (preds == y).sum().item()
+            total_loss += loss.item() * X.size(0)
+            total_samples += X.size(0)
+    return total_loss / total_samples, total_correct / total_samples
 
-            acc = (preds == y).float().mean().item()
-            tot_loss += loss.item()*y.size(0)
-            tot_corr += (preds == y).sum().item()
-            tot += y.size(0)
-
-            pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.2%}")
-    return tot_loss/tot, tot_corr/tot
-
-def plot_history(hist, save_path="training_progress.png"):
-    plt.figure(figsize=(12,5))
-    epochs = range(1, len(hist['tr_loss'])+1)
-    plt.subplot(1,2,1)
-    plt.plot(epochs, hist['tr_loss'], label='Train')
-    plt.plot(epochs, hist['val_loss'], label='Val')
-    plt.title('Loss'); plt.xlabel('Epoch'); plt.legend()
-    plt.subplot(1,2,2)
-    plt.plot(epochs, hist['tr_acc'], label='Train')
-    plt.plot(epochs, hist['val_acc'], label='Val')
-    plt.title('Accuracy'); plt.xlabel('Epoch'); plt.legend()
-    plt.tight_layout(); plt.savefig(save_path); plt.close()
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('--resume', type=str)
-    p.add_argument('--save_dir', type=str, default='checkpoints')
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--resume', type=str, help='Path to checkpoint')
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--batch', type=int, default=256)
+    parser.add_argument('--amp', action='store_true')
+    args = parser.parse_args()
 
-    device = torch.device('mps' if torch.backends.mps.is_available()
-                          else 'cuda' if torch.cuda.is_available()
-                          else 'cpu')
-    print_header(f"Using device: {device}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    pin_mem = device.type == 'cuda'
+    use_amp = pin_mem and args.amp
 
-    tr_loader, val_loader, le = get_dataloaders(
+    tr_dl, val_dl, label_encoder = get_dataloaders(
         'data/raw/RML2016.10a_dict.pkl',
-        batch_size=256, num_workers=8
+        batch_size=args.batch,
+        pin_memory=pin_mem,
+        num_workers=4
     )
 
-    model = CNNClassifier(num_classes=len(le.classes_)).to(device)
-    start_epoch = 0
-    if args.resume:
-        opt = AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
-        model, opt, start_epoch, _ = load_checkpoint(
-            model, opt, args.resume, device
-        )
-        print_success(f"Resumed from epoch {start_epoch}")
-    else:
-        opt = AdamW(model.parameters(), lr=3e-3, weight_decay=1e-4)
-        print_success("Starting new training")
+    model = CNNClassifier(num_classes=len(label_encoder.classes_)).to(device)
+    opt = AdamW(model.parameters(), lr=3e-3, weight_decay=1e-4)
+    total_steps = args.epochs * len(tr_dl)
+    sched = OneCycleLR(opt, max_lr=1e-2, total_steps=total_steps,
+                       pct_start=0.3, div_factor=25, final_div_factor=1e4)
+    crit = FocalLoss(gamma=2.0)
+    scaler = GradScaler(enabled=use_amp)
 
-    total_steps = 100 * len(tr_loader)
-    scheduler = OneCycleLR(
-        opt, max_lr=1e-2, total_steps=total_steps,
-        pct_start=0.3, anneal_strategy='cos',
-        div_factor=25, final_div_factor=1e4
-    )
-    criterion = FocalLoss(gamma=2.0)
-
-    history = {'tr_loss':[], 'val_loss':[], 'tr_acc':[], 'val_acc':[]}
     best_acc = 0.0
+    for epoch in trange(args.epochs, desc='Epochs'):
+        tr_loss, tr_acc = train_epoch(model, tr_dl, opt, sched, crit,
+                                      scaler, device, pin_mem, use_amp)
+        val_loss, val_acc = valid_epoch(model, val_dl, crit,
+                                        device, pin_mem, use_amp)
+        print(f"Epoch {epoch+1}/{args.epochs} — Train: loss={tr_loss:.4f}, acc={tr_acc:.2%} | Val: loss={val_loss:.4f}, acc={val_acc:.2%}")
 
-    for epoch in range(start_epoch, 50):
-        print_header(f"Epoch {epoch+1}/100")
-        tr_loss, tr_acc = train_epoch(model, tr_loader, opt, scheduler, criterion, device)
-        val_loss, val_acc = valid_epoch(model, val_loader, criterion, device)
-
-        history['tr_loss'].append(tr_loss)
-        history['val_loss'].append(val_loss)
-        history['tr_acc'].append(tr_acc)
-        history['val_acc'].append(val_acc)
-
-        print(f"Epoch {epoch+1}: Tr Acc={tr_acc:.2%} | Val Acc={val_acc:.2%}")
         if val_acc > best_acc:
             best_acc = val_acc
-            save_checkpoint(
-                model, opt, epoch+1, val_loss, val_acc,
-                le.classes_, args.save_dir, is_best=True
-            )
-            print_success(f"Best acc {best_acc:.2%} saved")
-        if (epoch+1)%10==0:
-            save_checkpoint(
-                model, opt, epoch+1, val_loss, val_acc,
-                le.classes_, args.save_dir, is_best=False
-            )
+            save_checkpoint(model, opt, epoch+1,
+                            val_loss, val_acc,
+                            label_encoder.classes_,
+                            is_best=True)
+            print(f"New best accuracy: {val_acc:.2%} - model saved!")
 
-    plot_history(history)
-    print_header("Training finished")
-
-if __name__=='__main__':
+if __name__ == '__main__':
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
     main()
-
-
-# Usege
-# python src/train.py --resume checkpoints/best_model.pth 
