@@ -115,7 +115,7 @@ def main():
 
     train_loader, val_loader, num_classes = get_dataloaders(
         'data/raw/radioml2018/versions/2/GOLD_XYZ_OSC.0001_1024.hdf5',
-        batch_size=args.batch, num_workers=10, val_fraction=0.2
+        batch_size=args.batch, num_workers=4, val_fraction=0.2
     )
 
     model = SOTAClassifier(num_classes).to(device)
@@ -145,7 +145,7 @@ def main():
 
         if val_acc > best_acc:
             best_acc = val_acc; wait = 0
-            torch.save(model.state_dict(), 'best.pth')
+            torch.save(model.state_dict(), 'checkpoints/best.pth')
             print(f"→ New best: {best_acc:.2f}%, saving best.pth")
             class_names = train_loader.dataset.y.tolist()
             class_names = [f"C{i}" for i in range(num_classes)]
