@@ -7,3 +7,4 @@ tensorboard==2.15.0
 tqdm
 colorama
 h5py
+kagglehub

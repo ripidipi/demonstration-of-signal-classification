@@ -36,6 +36,8 @@ def load_checkpoint(model, optimizer, checkpoint_path, device):
     else:
         le_classes = checkpoint['classes']
 
+    from sklearn.preprocessing import LabelEncoder
+    import numpy as np
     le = LabelEncoder()
     if len(le_classes) > 0:
         le.classes_ = np.array(le_classes)

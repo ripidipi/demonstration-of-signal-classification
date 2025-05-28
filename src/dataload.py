@@ -1,10 +1,18 @@
 import os
 import numpy as np
+import kagglehub
 import h5py
+
+
+def download():
+    path = kagglehub.dataset_download("pinxau1000/radioml2018")
+
+    print("Path to dataset files:", path)
 
 
 def load_radioml2018(path="data/raw/radioml2018/versions/2/GOLD_XYZ_OSC.0001_1024.hdf5"):
     if not os.path.isfile(path):
+        download()
         raise FileNotFoundError(f"Файл не найден: {path}")
 
     print(f"Загружаем из HDF5: {path}...")
