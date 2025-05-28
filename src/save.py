@@ -28,25 +28,26 @@ def save_checkpoint(model, optimizer, epoch, loss, acc, le_classes, save_dir="ch
     torch.save(state, path)
     print(f"Checkpoint saved: {path}")
 
-def load_checkpoint(model, optimizer, checkpoint_path, device):
+def load_checkpoint(model, checkpoint_path, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    if 'format_version' not in checkpoint:
-        le_classes = checkpoint.get('le_data', {}).get('classes', [])
+
+    if isinstance(checkpoint, dict):
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+
+        le = checkpoint.get('le', checkpoint.get('label_encoder', None))
+        if le is not None:
+            print("Model and label encoder loaded from checkpoint")
+        else:
+            print("Model loaded from checkpoint; no label encoder found in checkpoint")
     else:
-        le_classes = checkpoint['classes']
+        model.load_state_dict(checkpoint)
+        le = None
+        print("Model loaded from simple state_dict checkpoint")
 
-    le = LabelEncoder()
-    if len(le_classes) > 0:
-        le.classes_ = np.array(le_classes)
+    model.eval()
+    return model, le
 
-    model.load_state_dict(checkpoint['model_state'])
-    optimizer.load_state_dict(checkpoint['optimizer_state'])
-
-    for state in optimizer.state.values():
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor):
-                state[k] = v.to(device)
-
-    print(f"Loaded checkpoint from epoch {checkpoint['epoch']} (loss: {checkpoint['loss']:.4f}, acc: {checkpoint['accuracy']:.4f})")
-    return model, optimizer, checkpoint['epoch'], le
