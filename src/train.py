@@ -1,155 +1,162 @@
 import os
-import argparse
-import matplotlib.pyplot as plt
-from tqdm import tqdm
 import torch
-import torch.nn as nn
-from torch.optim import AdamW
+import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import OneCycleLR
-from colorama import Fore, Style, init
+from loader import get_dataloaders
+from model import SOTAClassifier
+from losses import HybridLoss
+from tqdm import tqdm
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
 
-from dataset import get_dataloaders
-from model import CNNClassifier
-from save import load_checkpoint, save_checkpoint
-from some_decorators import print_header, print_success, print_warning
+def plot_confusion_matrix(y_true, y_pred, class_names, save_path='plots/confusion_matrix.png'):
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='viridis',
+                xticklabels=class_names, yticklabels=class_names)
+    plt.ylabel("True label"); plt.xlabel("Predicted label")
+    plt.title("Confusion Matrix")
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=300)
+    plt.close()
 
-init(autoreset=True)
+def mixup_data(x1, x2, const, snr, y, alpha=0.4):
+    if alpha <= 0:
+        return x1, x2, const, snr, y, y, 1.0
+    lam = np.random.beta(alpha, alpha)
+    idx = torch.randperm(x1.size(0), device=x1.device)
+    return (lam*x1 + (1-lam)*x1[idx],
+            lam*x2 + (1-lam)*x2[idx],
+            lam*const + (1-lam)*const[idx],
+            lam*snr + (1-lam)*snr[idx],
+            y, y[idx], lam)
 
-class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, weight=None):
-        super().__init__()
-        self.gamma = gamma
-        self.ce = nn.CrossEntropyLoss(weight=weight)
-
-    def forward(self, logits, target):
-        logp = -self.ce(logits, target)
-        p = torch.exp(logp)
-        loss = -((1 - p) ** self.gamma) * logp
-        return loss.mean()
-
-def train_epoch(model, loader, optimizer, scheduler, criterion, device):
+def train_one_epoch(model, loader, opt, crit, scaler, device, scheduler, mixup_alpha, clip_grad=1.0):
     model.train()
-    tot_loss, tot_corr, tot = 0, 0, 0
-    pbar = tqdm(loader, desc=f"{Fore.BLUE}Train{Style.RESET_ALL}", leave=False)
-    for X, y in pbar:
-        X, y = X.to(device), y.to(device)
-        optimizer.zero_grad()
-        logits = model(X)
-        loss = criterion(logits, y)
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
+    total_loss = 0.0; total_corr = 0; total_samples = 0
 
-        preds = logits.argmax(1)
-        acc = (preds == y).float().mean().item()
-        tot_loss += loss.item()*y.size(0)
-        tot_corr += (preds == y).sum().item()
-        tot += y.size(0)
+    for x1, x2, const, snr, y in tqdm(loader, desc='Train'):
+        x1, x2, const, snr, y = [t.to(device) for t in (x1, x2, const, snr, y)]
+        snr = snr.view(-1,1)
 
-        pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.2%}")
-    return tot_loss/tot, tot_corr/tot
+        x1, x2, const, snr, y1, y2, lam = mixup_data(x1, x2, const, snr, y, alpha=mixup_alpha)
 
-def valid_epoch(model, loader, criterion, device):
+        opt.zero_grad()
+        with autocast(enabled=(scaler is not None)):
+            out = model(x1, x2, const, snr)
+            loss1 = crit(out, y1)
+            loss2 = crit(out, y2)
+            loss = lam*loss1 + (1-lam)*loss2
+            loss = loss.mean()
+
+        if scaler:
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            opt.step()
+
+        if scheduler:
+            scheduler.step()
+
+        preds = out.argmax(dim=1)
+        total_corr += (lam*(preds==y1).sum().item() + (1-lam)*(preds==y2).sum().item())
+        total_samples += y.size(0)
+        total_loss += loss.item() * y.size(0)
+
+    return total_loss/total_samples, 100.*total_corr/total_samples
+
+def validate(model, loader, crit, device):
     model.eval()
-    tot_loss, tot_corr, tot = 0, 0, 0
+    total_loss = 0.0; total_corr = 0; total_samples = 0
+    all_preds, all_labels = [], []
+
     with torch.no_grad():
-        pbar = tqdm(loader, desc=f"{Fore.GREEN}Valid{Style.RESET_ALL}", leave=False)
-        for X, y in pbar:
-            X, y = X.to(device), y.to(device)
-            logits = model(X)
-            loss = criterion(logits, y)
-            preds = logits.argmax(1)
+        for x1, x2, const, snr, y in tqdm(loader, desc='Valid'):
+            x1, x2, const, snr, y = [t.to(device) for t in (x1, x2, const, snr, y)]
+            snr = snr.view(-1,1)
 
-            acc = (preds == y).float().mean().item()
-            tot_loss += loss.item()*y.size(0)
-            tot_corr += (preds == y).sum().item()
-            tot += y.size(0)
+            out = model(x1, x2, const, snr)
+            loss = crit(out, y).mean()
+            preds = out.argmax(dim=1)
 
-            pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.2%}")
-    return tot_loss/tot, tot_corr/tot
+            total_loss += loss.item() * y.size(0)
+            total_corr += (preds==y).sum().item()
+            total_samples += y.size(0)
 
-def plot_history(hist, save_path="training_progress.png"):
-    plt.figure(figsize=(12,5))
-    epochs = range(1, len(hist['tr_loss'])+1)
-    plt.subplot(1,2,1)
-    plt.plot(epochs, hist['tr_loss'], label='Train')
-    plt.plot(epochs, hist['val_loss'], label='Val')
-    plt.title('Loss'); plt.xlabel('Epoch'); plt.legend()
-    plt.subplot(1,2,2)
-    plt.plot(epochs, hist['tr_acc'], label='Train')
-    plt.plot(epochs, hist['val_acc'], label='Val')
-    plt.title('Accuracy'); plt.xlabel('Epoch'); plt.legend()
-    plt.tight_layout(); plt.savefig(save_path); plt.close()
+            all_preds.append(preds.cpu())
+            all_labels.append(y.cpu())
+
+    all_preds = torch.cat(all_preds).numpy()
+    all_labels = torch.cat(all_labels).numpy()
+    return total_loss/total_samples, 100.*total_corr/total_samples, all_labels, all_preds
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('--resume', type=str)
-    p.add_argument('--save_dir', type=str, default='checkpoints')
-    args = p.parse_args()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch',  type=int, default=512)
+    parser.add_argument('--lr',     type=float, default=1e-3)
+    parser.add_argument('--wd',     type=float, default=1e-3)
+    parser.add_argument('--mixup',  type=float, default=0.4)
+    parser.add_argument('--no_amp', action='store_true')
+    parser.add_argument('--resume', action='store_true')
+    args = parser.parse_args()
 
-    device = torch.device('mps' if torch.backends.mps.is_available()
-                          else 'cuda' if torch.cuda.is_available()
-                          else 'cpu')
-    print_header(f"Using device: {device}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
 
-    tr_loader, val_loader, le = get_dataloaders(
-        'data/raw/RML2016.10a_dict.pkl',
-        batch_size=256, num_workers=8
+    train_loader, val_loader, num_classes = get_dataloaders(
+        'data/raw/radioml2018/versions/2/GOLD_XYZ_OSC.0001_1024.hdf5',
+        batch_size=args.batch, num_workers=4, val_fraction=0.2
     )
 
-    model = CNNClassifier(num_classes=len(le.classes_)).to(device)
-    start_epoch = 0
-    if args.resume:
-        opt = AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
-        model, opt, start_epoch, _ = load_checkpoint(
-            model, opt, args.resume, device
-        )
-        print_success(f"Resumed from epoch {start_epoch}")
-    else:
-        opt = AdamW(model.parameters(), lr=3e-3, weight_decay=1e-4)
-        print_success("Starting new training")
+    model = SOTAClassifier(num_classes).to(device)
+    opt   = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    crit  = HybridLoss(alpha=0.25, gamma=2.0, smoothing=0.1)
+    scaler= None if args.no_amp else GradScaler()
 
-    total_steps = 100 * len(tr_loader)
-    scheduler = OneCycleLR(
-        opt, max_lr=1e-2, total_steps=total_steps,
-        pct_start=0.3, anneal_strategy='cos',
-        div_factor=25, final_div_factor=1e4
-    )
-    criterion = FocalLoss(gamma=2.0)
+    total_steps = args.epochs * len(train_loader)
+    sched = OneCycleLR(opt, max_lr=args.lr, total_steps=total_steps,
+                       pct_start=0.1, anneal_strategy='cos')
 
-    history = {'tr_loss':[], 'val_loss':[], 'tr_acc':[], 'val_acc':[]}
+    start_epoch = 1
     best_acc = 0.0
+    patience, wait = 10, 0
 
-    for epoch in range(start_epoch, 50):
-        print_header(f"Epoch {epoch+1}/100")
-        tr_loss, tr_acc = train_epoch(model, tr_loader, opt, scheduler, criterion, device)
-        val_loss, val_acc = valid_epoch(model, val_loader, criterion, device)
+    if args.resume and os.path.exists('best.pth'):
+        ckpt = torch.load('best.pth', map_location=device)
+        model.load_state_dict(ckpt)
+        print("Loaded checkpoint best.pth")
 
-        history['tr_loss'].append(tr_loss)
-        history['val_loss'].append(val_loss)
-        history['tr_acc'].append(tr_acc)
-        history['val_acc'].append(val_acc)
+    for epoch in range(start_epoch, args.epochs+1):
+        tr_loss, tr_acc = train_one_epoch(model, train_loader, opt, crit, scaler, device, sched, args.mixup)
+        val_loss, val_acc, y_true, y_pred = validate(model, val_loader, crit, device)
 
-        print(f"Epoch {epoch+1}: Tr Acc={tr_acc:.2%} | Val Acc={val_acc:.2%}")
+        print(f"[{epoch:03d}] train_loss={tr_loss:.4f} train_acc={tr_acc:.2f}% | "
+              f"val_loss={val_loss:.4f} val_acc={val_acc:.2f}%")
+
         if val_acc > best_acc:
-            best_acc = val_acc
-            save_checkpoint(
-                model, opt, epoch+1, val_loss, val_acc,
-                le.classes_, args.save_dir, is_best=True
-            )
-            print_success(f"Best acc {best_acc:.2%} saved")
-        if (epoch+1)%10==0:
-            save_checkpoint(
-                model, opt, epoch+1, val_loss, val_acc,
-                le.classes_, args.save_dir, is_best=False
-            )
+            best_acc = val_acc; wait = 0
+            torch.save(model.state_dict(), 'checkpoints/best.pth')
+            print(f"→ New best: {best_acc:.2f}%, saving best.pth")
+            class_names = train_loader.dataset.y.tolist()
+            class_names = [f"C{i}" for i in range(num_classes)]
+            plot_confusion_matrix(y_true, y_pred, class_names, save_path='plots/confusion_best.png')
+        else:
+            wait += 1
+            if wait >= patience:
+                print(f"No improvement in {patience} epochs, stopping.")
+                break
 
-    plot_history(history)
-    print_header("Training finished")
+    print("Training complete. Best val_acc: {:.2f}%".format(best_acc))
 
-if __name__=='__main__':
+if __name__ == '__main__':
     main()
-
-
-# Usege
-# python src/train.py --resume checkpoints/best_model.pth 

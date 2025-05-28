@@ -1,45 +1,91 @@
-import pickle, numpy as np, torch
+import os
+import numpy as np
+import h5py
+import torch
 from torch.utils.data import Dataset
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedShuffleSplit
 
-class RadioMLDataset(Dataset):
-    def __init__(self, path, split='train', val_fraction=0.2, augment=False, seed=42):
-        with open(path, 'rb') as f:
-            Xd = pickle.load(f, encoding='latin1')
-        Xs, ys = [], []
-        for (mod, snr), data in Xd.items():
-            Xs.append(data); ys += [mod]*len(data)
-        X = np.vstack(Xs)
-        le = LabelEncoder(); y = le.fit_transform(ys)
-        Xtr, Xv, ytr, yv = train_test_split(
-            X, y, test_size=val_fraction, stratify=y, random_state=seed
+
+def augment_iq(x, snr):
+    c = x[0] + 1j * x[1]
+
+    phase = np.random.uniform(-np.pi / 4, np.pi / 4)
+    c *= np.exp(1j * phase)
+
+    if np.random.rand() < 0.5:
+        L = x.shape[1]
+        freq_offset = np.random.uniform(-0.02, 0.02) 
+        t = np.arange(L)
+        c *= np.exp(1j * 2 * np.pi * freq_offset * t)
+
+    if np.random.rand() < 0.5:
+        shift = np.random.randint(-50, 50)
+        c = np.roll(c, shift)
+
+    if np.random.rand() < 0.5:
+        scale = np.random.uniform(0.9, 1.1)
+        c *= scale
+
+    noise_std = 0.01 * (1 - (snr / 30))
+    noise = np.random.normal(0, noise_std, size=c.shape) + 1j * np.random.normal(0, noise_std, size=c.shape)
+    c += noise
+
+    if np.random.rand() < 0.3:
+        L = x.shape[1]
+        mask_len = np.random.randint(5, int(0.1 * L))
+        start = np.random.randint(0, L - mask_len)
+        c[start:start + mask_len] = 0
+
+    x_aug = np.stack([np.real(c), np.imag(c)])
+    return x_aug
+
+
+def compute_constellation(x, bins=64, lim=1.5):
+    I, Q = x[0], x[1]
+    H, _, _ = np.histogram2d(I, Q, bins=bins,
+                             range=[[-lim, lim], [-lim, lim]])
+    return H[np.newaxis].astype(np.float32)
+
+
+class RadioMLH5Dataset(Dataset):
+    def __init__(self, h5_path, split='train', val_fraction=0.2,
+                 random_seed=42, transform=None):
+        if not os.path.isfile(h5_path):
+            raise FileNotFoundError(f"HDF5 файл не найден: {h5_path}")
+        self.h5_path = h5_path
+        self.transform = transform
+        with h5py.File(h5_path, 'r') as f:
+            Y = f['Y'][:]
+            Z = f['Z'][:].reshape(-1)
+        all_y = np.argmax(Y, axis=1)
+        all_snr = Z.astype(np.float32)
+        N = len(all_y)
+        splitter = StratifiedShuffleSplit(n_splits=1,
+                                          test_size=val_fraction,
+                                          random_state=random_seed)
+        train_idx, val_idx = next(splitter.split(np.zeros(N), all_y))
+        idx = train_idx if split == 'train' else val_idx
+        self.indices = idx
+        self.y = all_y[idx]
+        self.snrs = all_snr[idx]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        real_idx = int(self.indices[index])
+        with h5py.File(self.h5_path, 'r') as f:
+            x = f['X'][real_idx]  
+        iq = x.T  
+        snr = float(self.snrs[index])
+        label = int(self.y[index])
+        iq_raw = iq.copy()
+        iq_aug = self.transform(iq.copy(), snr) if self.transform else iq.copy()
+        const = compute_constellation(iq_aug)
+        return (
+            torch.from_numpy(iq_raw).float(),
+            torch.from_numpy(iq_aug).float(),
+            torch.from_numpy(const).float(),
+            torch.tensor([snr], dtype=torch.float32),
+            torch.tensor(label, dtype=torch.long)
         )
-        self.X, self.y = (Xtr, ytr) if split=='train' else (Xv, yv)
-        self.augment = augment; np.random.seed(seed); self.le = le
-
-    def __len__(self): return len(self.y)
-    def __getitem__(self, i):
-        x, y = self.X[i].copy(), self.y[i]
-        if self.augment: x = self._augment(x)
-        return torch.from_numpy(x).float(), y
-
-    def _augment(self, x):
-        # Gaussian noise
-        snr = np.random.uniform(0,20)
-        p_sig = x.var(); p_no = p_sig/10**(snr/10)
-        x = x + np.sqrt(p_no)*np.random.randn(*x.shape)
-        # random shift
-        if np.random.rand()<0.5:
-            x = np.roll(x, np.random.randint(x.shape[1]), axis=1)
-        # random scale
-        if np.random.rand()<0.5:
-            x *= np.random.uniform(0.7,1.3)
-        # time-mask
-        if np.random.rand()<0.2:
-            L = x.shape[1]; m = np.random.randint(L//20, L//5)
-            s = np.random.randint(0, L-m); x[:,s:s+m]=0
-        # freq-mask
-        if np.random.rand()<0.2:
-            ch = np.random.randint(x.shape[0]); x[ch,:]=0
-        return x

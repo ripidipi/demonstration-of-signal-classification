@@ -1,53 +1,53 @@
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import os
-import argparse
+import torch
+import numpy as np
 from datetime import datetime
-from sklearn.preprocessing import LabelEncoder  
-from dataset import get_dataloaders
-import matplotlib.pyplot as plt
-from model import CNNClassifier
+from sklearn.preprocessing import LabelEncoder
 
 def save_checkpoint(model, optimizer, epoch, loss, acc, le_classes, save_dir="checkpoints", is_best=False):
     os.makedirs(save_dir, exist_ok=True)
-    
+
+    if hasattr(le_classes, 'tolist'):
+        classes = le_classes.tolist()
+    else:
+        classes = list(le_classes)
+
     state = {
         'epoch': epoch,
         'model_state': model.state_dict(),
         'optimizer_state': optimizer.state_dict(),
         'loss': loss,
         'accuracy': acc,
-        'classes': le_classes.tolist(),
+        'classes': classes,
         'format_version': 2,
         'timestamp': datetime.now().isoformat()
     }
-    
+
     filename = f"checkpoint_epoch_{epoch}.pth" if not is_best else "best_model.pth"
     path = os.path.join(save_dir, filename)
     torch.save(state, path)
     print(f"Checkpoint saved: {path}")
 
-def load_checkpoint(model, optimizer, checkpoint_path, device):
+def load_checkpoint(model, checkpoint_path, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    if 'format_version' not in checkpoint:  
-        le_classes = checkpoint.get('le_data', {}).get('classes', [])
+
+
+    if isinstance(checkpoint, dict):
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+
+        le = checkpoint.get('le', checkpoint.get('label_encoder', None))
+        if le is not None:
+            print("Model and label encoder loaded from checkpoint")
+        else:
+            print("Model loaded from checkpoint; no label encoder found in checkpoint")
     else:
-        le_classes = checkpoint['classes']
-    
-    le = LabelEncoder()
-    if len(le_classes) > 0:
-        le.classes_ = np.array(le_classes)
-    
-    model.load_state_dict(checkpoint['model_state'])
-    
-    optimizer.load_state_dict(checkpoint['optimizer_state'])
-    for state in optimizer.state.values():
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor):
-                state[k] = v.to(device)
-    
-    print(f"Loaded checkpoint from epoch {checkpoint['epoch']} (loss: {checkpoint['loss']:.4f}, acc: {checkpoint['accuracy']:.4f})")
-    return model, optimizer, checkpoint['epoch'], le
+        model.load_state_dict(checkpoint)
+        le = None
+        print("Model loaded from simple state_dict checkpoint")
+
+    model.eval()
+    return model, le
+
