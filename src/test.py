@@ -2,8 +2,8 @@ import os
 import torch
 import matplotlib.pyplot as plt
 import random
-from dataset import get_dataloaders
-from model import CNNClassifier
+from loader import get_dataloaders
+from model import SOTAClassifier
 from save import load_checkpoint
 from some_decorators import print_header, print_success
 
@@ -49,7 +49,7 @@ def run_demo(checkpoint_path, n_samples=5):
         else "cpu"
     )
 
-    model = CNNClassifier(num_classes=len(le.classes_)).to(device)
+    model = SOTAClassifier(num_classes=len(le.classes_)).to(device)
     optimizer = torch.optim.Adam(model.parameters())
     model, optimizer, _, _ = load_checkpoint(model, optimizer, checkpoint_path, device)
     model.eval()
