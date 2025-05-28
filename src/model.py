@@ -1,69 +1,105 @@
-import torch, torch.nn as nn, torch.nn.functional as F
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-class SeparableConv1d(nn.Module):
-    def __init__(self, in_ch, out_ch, k, p):
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction=16):
         super().__init__()
-        self.depth = nn.Conv1d(in_ch, in_ch, k, padding=p, groups=in_ch, bias=False)
-        self.point = nn.Conv1d(in_ch, out_ch, 1, bias=False)
-        self.bn    = nn.BatchNorm1d(out_ch)
-    def forward(self,x): return F.relu(self.bn(self.point(self.depth(x))))
-
-class ResSEBlock(nn.Module):
-    def __init__(self,in_ch,out_ch,k,p,reduction=8):
-        super().__init__()
-        self.conv1 = SeparableConv1d(in_ch,out_ch,k,p)
-        self.conv2 = SeparableConv1d(out_ch,out_ch,k,p)
-        self.skip  = nn.Conv1d(in_ch,out_ch,1) if in_ch!=out_ch else nn.Identity()
-        self.se    = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Linear(out_ch, out_ch//reduction),
-            nn.ReLU(),
-            nn.Linear(out_ch//reduction, out_ch),
+        self.avg = nn.AdaptiveAvgPool1d(1)
+        self.max = nn.AdaptiveMaxPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Conv1d(in_channels, in_channels // reduction, 1, bias=False),
+            nn.GELU(),
+            nn.Conv1d(in_channels // reduction, in_channels, 1, bias=False),
             nn.Sigmoid()
         )
-    def forward(self,x):
-        s = self.skip(x)
-        o = self.conv2(self.conv1(x))
-        w = self.se(o).unsqueeze(-1)
-        return F.relu(o*w + s)
 
-class TimeTransformer(nn.Module):
-    def __init__(self,dim,heads=8,layers=3):
-        super().__init__()
-        layer = nn.TransformerEncoderLayer(
-            d_model=dim, nhead=heads, dim_feedforward=dim*2,
-            dropout=0.1, activation='gelu', batch_first=True)
-        self.enc = nn.TransformerEncoder(layer, layers)
-    def forward(self,x):
-        t = x.permute(0,2,1)
-        t = self.enc(t)
-        return t.permute(0,2,1)
+    def forward(self, x):
+        avg_att = self.fc(self.avg(x))
+        max_att = self.fc(self.max(x))
+        return x * (avg_att + max_att)
 
-class CNNClassifier(nn.Module):
-    def __init__(self,num_classes):
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=0.0):
         super().__init__()
-        self.stem = nn.Sequential(
-            ResSEBlock(2,64,3,1),
-            ResSEBlock(64,128,3,1),
-            nn.MaxPool1d(2),
-            ResSEBlock(128,256,3,1),
-            nn.MaxPool1d(2),
-            ResSEBlock(256,512,3,1)
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
+
+class EnhancedResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1, expansion=4, drop_path=0.1):
+        super().__init__()
+        mid_ch = out_ch * expansion
+        self.conv = nn.Sequential(
+            nn.Conv1d(in_ch, mid_ch, 3, stride, padding=1, bias=False),
+            nn.BatchNorm1d(mid_ch),
+            nn.GELU(),
+            ChannelAttention(mid_ch),
+            nn.Conv1d(mid_ch, out_ch, 1, bias=False),
+            nn.BatchNorm1d(out_ch)
         )
-        self.trans = TimeTransformer(dim=512)
-        self.pool  = nn.AdaptiveAvgPool1d(1)
-        self.fc    = nn.Sequential(
-            nn.Flatten(),
-            nn.Dropout(0.5),
-            nn.Linear(512,256),
-            nn.ReLU(),
-            nn.BatchNorm1d(256),
-            nn.Dropout(0.5),
-            nn.Linear(256,num_classes)
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_ch != out_ch:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_ch, out_ch, 1, stride, bias=False),
+                nn.BatchNorm1d(out_ch)
+            )
+        self.att = ChannelAttention(out_ch)
+        self.drop_path = DropPath(drop_path)
+
+    def forward(self, x):
+        res = self.conv(x)
+        sc = self.shortcut(x)
+        out = res + sc
+        return F.gelu(self.att(self.drop_path(out)))
+
+class SOTAClassifier(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+
+        def make_backbone():
+            return nn.Sequential(
+                EnhancedResBlock(2, 64, stride=2, drop_path=0.05),
+                EnhancedResBlock(64, 128, stride=2, drop_path=0.05),
+                EnhancedResBlock(128, 256, stride=2, drop_path=0.1),
+                EnhancedResBlock(256, 512, stride=2, drop_path=0.1),
+                EnhancedResBlock(512, 512, stride=2, drop_path=0.1),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten()
+            )
+
+        self.backb1 = make_backbone()
+        self.backb2 = make_backbone()
+
+        self.const_fc = nn.Sequential(
+            nn.Linear(64 * 64, 256), nn.GELU(), nn.BatchNorm1d(256),
+            nn.Linear(256, 128), nn.GELU(), nn.BatchNorm1d(128),
+            nn.Linear(128, 64), nn.GELU()
         )
-    def forward(self,x):
-        x = self.stem(x)
-        x = self.trans(x)
-        x = self.pool(x)
-        return self.fc(x)
+
+        self.snr_fc = nn.Sequential(
+            nn.Linear(1, 128), nn.GELU(), nn.BatchNorm1d(128),
+            nn.Linear(128, 64), nn.GELU()
+        )
+
+        fusion_dim = 512 + 512 + 64 + 64
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_dim, 512), nn.BatchNorm1d(512), nn.GELU(), nn.Dropout(0.5),
+            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.GELU(), nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, iq1, iq2, const, snr):
+        f1 = self.backb1(iq1)
+        f2 = self.backb2(iq2)
+        cfeat = self.const_fc(const.view(const.size(0), -1))
+        sfeat = self.snr_fc(snr)
+        x = torch.cat([f1, f2, cfeat, sfeat], dim=1)
+        return self.classifier(x)
