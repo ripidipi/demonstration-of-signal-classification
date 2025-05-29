@@ -12,7 +12,9 @@ from tqdm import tqdm
 from loader import get_dataloaders
 from model import SOTAClassifier
 from save import load_checkpoint
+import seaborn as sns 
 from some_decorators import print_header, print_success
+
 
 classes = [
     'OOK','4ASK','8ASK','BPSK','QPSK','8PSK','16PSK','32PSK',
@@ -25,6 +27,21 @@ le.classes_ = np.array(classes)
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
 os.makedirs("samples", exist_ok=True)
+
+
+
+def plot_confusion_matrix(cm, class_names, out_path="samples/confusion_matrix.png"):
+    plt.figure(figsize=(14, 12))
+    sns.heatmap(cm, annot=False, fmt='d', cmap="Blues", xticklabels=class_names, yticklabels=class_names)
+    plt.title("Confusion Matrix")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
 
 def visualize_signal(iq, true_label, pred_label, idx, out_dir="samples"):
     color = 'green' if true_label == pred_label else 'red'
@@ -81,6 +98,7 @@ def run_metrics(model, le, val_loader):
     print(f"Acc:{acc:.4f} Lat(ms):{avg_lat:.2f}")
     print(report)
     out = {'acc': acc, 'per_cls': per_cls, 'snr': snr_acc, 'cm': cm.tolist(), 'report': report}
+    plot_confusion_matrix(cm, le.classes_, out_path="samples/confusion_matrix.png")
     with open(os.path.join("samples","metrics.json"), 'w') as f:
         json.dump(out, f)
     print_success("Metrics saved")
@@ -93,7 +111,7 @@ if __name__ == "__main__":
     parser.add_argument("--metrics", action="store_true")
     parser.add_argument("--samples", type=int, default=5)
     args = parser.parse_args()
-    _, val_loader, _ = get_dataloaders("data/raw/radioml2018/versions/2/GOLD_XYZ_OSC.0001_1024.hdf5")
+    _, val_loader, _ = get_dataloaders("data/raw/radioml2018/versions/2/GOLD_XYZ_OSC.0001_1024.hdf5", batch_size=512)
     model = SOTAClassifier(num_classes=len(classes)).to(device)
     model, le_ckpt = load_checkpoint(model, args.checkpoint, device)
     if le_ckpt is not None:
